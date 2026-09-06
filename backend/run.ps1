@@ -15,4 +15,4 @@ if (Test-Path $envFile) {
 }
 
 Write-Host "Starting Maven build and execution..." -ForegroundColor Cyan
-mvn clean compile exec:java
+mvn clean compile spring-boot:run

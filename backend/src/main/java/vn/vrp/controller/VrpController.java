@@ -5,10 +5,14 @@ import org.springframework.http.ResponseEntity;
 import java.util.*;
 import java.sql.*;
 import vn.vrp.db.DatabaseConfig;
+import vn.vrp.algorithm.greedy.GreedyCvrpSolver;
+import vn.vrp.db.*;
+import vn.vrp.model.*;
+import vn.vrp.validator.*;
 
 @RestController
 @RequestMapping("/api/experiments")
-@CrossOrigin(origins = "*") // Allow React to call this API
+@CrossOrigin(origins = "*", methods = {RequestMethod.GET, RequestMethod.POST, RequestMethod.PUT, RequestMethod.DELETE, RequestMethod.OPTIONS}) // Allow React to call this API
 public class VrpController {
 
     @GetMapping
@@ -72,7 +76,7 @@ public class VrpController {
             
             // 2. Get Depots
             List<Map<String, Object>> depots = new ArrayList<>();
-            try (PreparedStatement stmt = conn.prepareStatement("SELECT * FROM DEPOT WHERE DATASET_ID = ?")) {
+            try (PreparedStatement stmt = conn.prepareStatement("SELECT d.DEPOT_ID, d.DEPOT_CODE, COALESCE(l.LATITUDE, l.Y_COORDINATE, 0) AS LATITUDE, COALESCE(l.LONGITUDE, l.X_COORDINATE, 0) AS LONGITUDE FROM DEPOT d JOIN LOCATION l ON d.LOCATION_ID = l.LOCATION_ID WHERE d.DATASET_ID = ?")) {
                 stmt.setLong(1, datasetId);
                 ResultSet rs = stmt.executeQuery();
                 while (rs.next()) {
@@ -87,7 +91,7 @@ public class VrpController {
             
             // 3. Get Customers
             List<Map<String, Object>> customers = new ArrayList<>();
-            try (PreparedStatement stmt = conn.prepareStatement("SELECT * FROM CUSTOMER WHERE DATASET_ID = ?")) {
+            try (PreparedStatement stmt = conn.prepareStatement("SELECT c.CUSTOMER_ID, c.CUSTOMER_CODE, COALESCE(l.LATITUDE, l.Y_COORDINATE, 0) AS LATITUDE, COALESCE(l.LONGITUDE, l.X_COORDINATE, 0) AS LONGITUDE FROM CUSTOMER c JOIN LOCATION l ON c.LOCATION_ID = l.LOCATION_ID WHERE c.DATASET_ID = ?")) {
                 stmt.setLong(1, datasetId);
                 ResultSet rs = stmt.executeQuery();
                 while (rs.next()) {
@@ -111,29 +115,27 @@ public class VrpController {
                     long routeId = rs.getLong("ROUTE_ID");
                     r.put("ROUTE_ID", routeId);
                     r.put("VEHICLE_CODE", rs.getString("VEHICLE_CODE"));
-                    r.put("TOTAL_LOAD", rs.getString("TOTAL_LOAD"));
+                    r.put("TOTAL_LOAD", rs.getString("TOTAL_LOAD_WEIGHT"));
                     r.put("TOTAL_DISTANCE", rs.getString("TOTAL_DISTANCE"));
                     
                     List<Map<String, Object>> stops = new ArrayList<>();
                     try (PreparedStatement stopStmt = conn.prepareStatement(
-                        "SELECT s.*, c.LATITUDE as C_LAT, c.LONGITUDE as C_LON, c.CUSTOMER_CODE, " +
-                        "d.LATITUDE as D_LAT, d.LONGITUDE as D_LON, d.DEPOT_CODE " +
+                        "SELECT s.*, COALESCE(l.LATITUDE, l.Y_COORDINATE, 0) AS LATITUDE, COALESCE(l.LONGITUDE, l.X_COORDINATE, 0) AS LONGITUDE, c.CUSTOMER_CODE, d.DEPOT_CODE " +
                         "FROM ROUTE_STOP_RESULT s " +
-                        "LEFT JOIN CUSTOMER c ON s.LOCATION_ID = c.CUSTOMER_ID AND s.ORDER_ID IS NOT NULL " +
-                        "LEFT JOIN DEPOT d ON s.LOCATION_ID = d.DEPOT_ID AND s.ORDER_ID IS NULL " +
+                        "JOIN LOCATION l ON s.LOCATION_ID = l.LOCATION_ID " +
+                        "LEFT JOIN CUSTOMER c ON s.LOCATION_ID = c.LOCATION_ID " +
+                        "LEFT JOIN DEPOT d ON s.LOCATION_ID = d.LOCATION_ID " +
                         "WHERE s.ROUTE_ID = ? ORDER BY s.SEQUENCE_NO")) {
                         stopStmt.setLong(1, routeId);
                         ResultSet sRs = stopStmt.executeQuery();
                         while (sRs.next()) {
                             Map<String, Object> s = new HashMap<>();
                             s.put("SEQUENCE_NO", sRs.getInt("SEQUENCE_NO"));
-                            double cLat = sRs.getDouble("C_LAT");
-                            double cLon = sRs.getDouble("C_LON");
-                            double dLat = sRs.getDouble("D_LAT");
-                            double dLon = sRs.getDouble("D_LON");
-                            s.put("LATITUDE", cLat != 0 ? cLat : dLat);
-                            s.put("LONGITUDE", cLon != 0 ? cLon : dLon);
-                            s.put("CODE", sRs.getString("CUSTOMER_CODE") != null ? sRs.getString("CUSTOMER_CODE") : sRs.getString("DEPOT_CODE"));
+                            s.put("LATITUDE", sRs.getDouble("LATITUDE"));
+                            s.put("LONGITUDE", sRs.getDouble("LONGITUDE"));
+                            String cCode = sRs.getString("CUSTOMER_CODE");
+                            String dCode = sRs.getString("DEPOT_CODE");
+                            s.put("CODE", cCode != null ? cCode : (dCode != null ? dCode : "LOC_" + sRs.getLong("LOCATION_ID")));
                             stops.add(s);
                         }
                     }
@@ -149,9 +151,134 @@ public class VrpController {
             
         } catch (Exception e) {
             e.printStackTrace();
-            return ResponseEntity.internalServerError().build();
+            Map<String, Object> err = new HashMap<>();
+            err.put("error", e.getMessage());
+            err.put("stacktrace", java.util.Arrays.toString(e.getStackTrace()));
+            try (Connection c = DatabaseConfig.from(DatabaseConfig.loadProperties()).connect()) {
+                ResultSet rs1 = c.createStatement().executeQuery("SELECT * FROM DEPOT LIMIT 1");
+                ResultSetMetaData md1 = rs1.getMetaData();
+                List<String> depotCols = new ArrayList<>();
+                for(int i=1; i<=md1.getColumnCount(); i++) depotCols.add(md1.getColumnName(i));
+                err.put("DEPOT_COLUMNS", depotCols);
+                
+                ResultSet rs2 = c.createStatement().executeQuery("SELECT * FROM CUSTOMER LIMIT 1");
+                ResultSetMetaData md2 = rs2.getMetaData();
+                List<String> custCols = new ArrayList<>();
+                for(int i=1; i<=md2.getColumnCount(); i++) custCols.add(md2.getColumnName(i));
+                err.put("CUSTOMER_COLUMNS", custCols);
+            } catch(Exception ex) {}
+            return ResponseEntity.status(500).body((Map) err);
         }
         
         return ResponseEntity.ok(response);
+    }
+
+    @PostMapping("/run")
+    public ResponseEntity<Map<String, Object>> runDemoExperiment(@RequestBody Map<String, Object> payload) {
+        long datasetId = 1;
+        long seed = System.currentTimeMillis();
+        double capacityOverride = -1;
+
+        if (payload != null) {
+            if (payload.containsKey("datasetId") && payload.get("datasetId") != null) {
+                datasetId = Long.parseLong(payload.get("datasetId").toString());
+            }
+            if (payload.containsKey("seed") && payload.get("seed") != null) {
+                seed = Long.parseLong(payload.get("seed").toString());
+            }
+            if (payload.containsKey("capacityOverride") && payload.get("capacityOverride") != null) {
+                try {
+                    double c = Double.parseDouble(payload.get("capacityOverride").toString());
+                    if (c > 0) capacityOverride = c;
+                } catch (Exception ignored) {}
+            }
+        }
+        
+        long experimentId = -1;
+        try (Connection connection = DatabaseConfig.from(DatabaseConfig.loadProperties()).connect()) {
+            ProblemInstance instance = new ProblemInstanceDao().load(connection, datasetId);
+
+            // If capacity override is specified, replace vehicles with overridden capacity
+            if (capacityOverride > 0) {
+                List<Vehicle> modVehicles = new ArrayList<>();
+                for (Vehicle v : instance.vehicles()) {
+                    modVehicles.add(new Vehicle(v.id(), v.code(), v.type(), capacityOverride, v.capacityVolume(),
+                        v.startDepotId(), v.endDepotId(), v.availableFrom(), v.availableTo(), v.fixedCost(), v.costPerKm(), v.costPerMinute()));
+                }
+                instance = new ProblemInstance(instance.datasetId(), instance.code(), instance.type(), instance.depot(), instance.customers(), modVehicles, instance.arcs());
+            }
+
+            Solution solution = new GreedyCvrpSolver().solve(instance);
+            ValidationResult validation = new SolutionValidator().validate(instance, solution);
+            
+            experimentId = new ExperimentDao().save(connection, instance, solution, validation, seed);
+        } catch (IllegalStateException e) {
+            Map<String, Object> err = new HashMap<>();
+            err.put("error", e.getMessage());
+            return ResponseEntity.badRequest().body(err);
+        } catch (Exception e) {
+            e.printStackTrace();
+            Map<String, Object> err = new HashMap<>();
+            err.put("error", "Lỗi thực thi: " + e.getMessage());
+            return ResponseEntity.status(500).body(err);
+        }
+        
+        return getExperimentDetail(experimentId);
+    }
+
+    @DeleteMapping("/{id}")
+    public ResponseEntity<Map<String, Object>> deleteExperiment(@PathVariable("id") long id) {
+        Map<String, Object> response = new HashMap<>();
+        try (Connection conn = DatabaseConfig.from(DatabaseConfig.loadProperties()).connect()) {
+            conn.setAutoCommit(false);
+            try {
+                // Delete EXPERIMENT_PARAMETER_VALUE
+                try (PreparedStatement stmt = conn.prepareStatement("DELETE FROM EXPERIMENT_PARAMETER_VALUE WHERE EXPERIMENT_ID = ?")) {
+                    stmt.setLong(1, id);
+                    stmt.executeUpdate();
+                }
+
+                // Delete ROUTE_STOP_RESULT
+                try (PreparedStatement stmt = conn.prepareStatement(
+                    "DELETE FROM ROUTE_STOP_RESULT WHERE ROUTE_ID IN (SELECT ROUTE_ID FROM ROUTE_RESULT WHERE RESULT_ID IN (SELECT RESULT_ID FROM EXPERIMENT_RESULT WHERE EXPERIMENT_ID = ?))")) {
+                    stmt.setLong(1, id);
+                    stmt.executeUpdate();
+                }
+
+                // Delete ROUTE_RESULT
+                try (PreparedStatement stmt = conn.prepareStatement(
+                    "DELETE FROM ROUTE_RESULT WHERE RESULT_ID IN (SELECT RESULT_ID FROM EXPERIMENT_RESULT WHERE EXPERIMENT_ID = ?)")) {
+                    stmt.setLong(1, id);
+                    stmt.executeUpdate();
+                }
+
+                // Delete EXPERIMENT_RESULT
+                try (PreparedStatement stmt = conn.prepareStatement("DELETE FROM EXPERIMENT_RESULT WHERE EXPERIMENT_ID = ?")) {
+                    stmt.setLong(1, id);
+                    stmt.executeUpdate();
+                }
+
+                // Delete EXPERIMENT
+                try (PreparedStatement stmt = conn.prepareStatement("DELETE FROM EXPERIMENT WHERE EXPERIMENT_ID = ?")) {
+                    stmt.setLong(1, id);
+                    stmt.executeUpdate();
+                }
+                
+                conn.commit();
+                response.put("success", true);
+                return ResponseEntity.ok(response);
+            } catch (Exception e) {
+                conn.rollback();
+                e.printStackTrace();
+                response.put("success", false);
+                response.put("error", e.getMessage());
+                return ResponseEntity.status(500).body(response);
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+            response.put("success", false);
+            response.put("error", e.getMessage());
+            return ResponseEntity.status(500).body(response);
+        }
     }
 }
