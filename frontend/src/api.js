@@ -32,6 +32,18 @@ export function formatClock(totalSeconds) {
   return [hours, minutes, remainder].map(value => String(value).padStart(2, '0')).join(':');
 }
 
+export function formatCost(value) {
+  const amount = new Intl.NumberFormat('vi-VN', {
+    maximumFractionDigits: 0,
+  }).format(Number(value) || 0);
+  return `${amount} VNĐ`;
+}
+
+export function costPerPoint(totalCost, servedPointCount) {
+  const count = Number(servedPointCount) || 0;
+  return count > 0 ? (Number(totalCost) || 0) / count : 0;
+}
+
 export function defaultParameters(algorithm) {
   return Object.fromEntries(
     (algorithm?.parameters || []).map(parameter => [parameter.code, parameter.defaultValue ?? '']),

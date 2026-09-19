@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  Activity, AlertTriangle, BarChart3, CheckCircle2, Clock3, Database,
+  Activity, AlertTriangle, BarChart3, Calculator, CheckCircle2, Clock3, Database, DollarSign,
   Dices, ListChecks, Map, Play, PlusCircle, Route, Settings, Sparkles,
   Trash2, Truck, X, XCircle,
 } from 'lucide-react';
 import MapVisualizer from './components/MapVisualizer';
-import { apiFetch, buildRunPayload, defaultParameters, formatClock } from './api';
+import {
+  apiFetch, buildRunPayload, costPerPoint, defaultParameters, formatClock, formatCost,
+} from './api';
 import { ROUTE_COLORS } from './routeColors';
 import './index.css';
 
@@ -22,7 +24,8 @@ const EMPTY_RUN = {
 
 const EMPTY_DATASET = {
   name: '', datasetType: 'CVRP', customerCount: 8, vehicleCount: 3,
-  vehicleCapacity: 40, minDemand: 5, maxDemand: 15, radiusKm: 6, preset: 'hcm',
+  vehicleCapacity: 40, vehicleFixedCost: 500000, costPerKm: 15000, costPerMinute: 3000,
+  minDemand: 5, maxDemand: 15, radiusKm: 6, preset: 'hcm',
 };
 
 function MetricCard({ icon, title, value, suffix, tone = 'blue' }) {
@@ -68,6 +71,49 @@ function ConvergenceChart({ iterations }) {
 
 function Empty({ text }) { return <div className="empty-state">{text}</div>; }
 
+function customerStops(route) {
+  const apiCount = Number(route?.CUSTOMER_STOP_COUNT);
+  if (apiCount > 0) return apiCount;
+  return (route?.stops || []).filter(stop => stop.STOP_TYPE === 'CUSTOMER').length;
+}
+
+function CalculationGuide() {
+  return <div className="calculation-page">
+    <div className="guide-intro">
+      <Calculator />
+      <div><h2>Cách tính và ý nghĩa thông số</h2><p>Đơn vị thời gian lưu trong hệ thống là giây; chi phí hiển thị bằng VNĐ. Điểm giao chỉ tính stop loại CUSTOMER, không tính hai lượt ghé kho.</p></div>
+    </div>
+
+    <h3>1. Chi phí vận hành</h3>
+    <div className="formula-grid">
+      <article className="formula-card"><strong>Chi phí cố định</strong><code>fixedCost = Σ fixedCost của xe được dùng</code><p>Phát sinh một lần cho mỗi xe có tuyến, dù tuyến dài hay ngắn.</p></article>
+      <article className="formula-card"><strong>Chi phí quãng đường</strong><code>distanceCost = tổng km × costPerKm</code><p>Tiền nhiên liệu, hao mòn hoặc đơn giá vận chuyển theo km.</p></article>
+      <article className="formula-card"><strong>Chi phí thời gian</strong><code>timeCost = (travel + waiting + service) / 60 × costPerMinute</code><p>Gồm thời gian chạy, chờ mở cửa time window và phục vụ tại khách.</p></article>
+      <article className="formula-card featured"><strong>Tổng chi phí</strong><code>totalCost = fixedCost + distanceCost + timeCost</code><p>Tổng chi phí của experiment là tổng chi phí tất cả tuyến xe.</p></article>
+      <article className="formula-card featured"><strong>Chi phí một điểm</strong><code>costPerPoint = totalCost / số CUSTOMER đã phục vụ</code><p>Đây là chi phí bình quân phân bổ cho một điểm giao, không phải chi phí biên riêng của khách đó.</p></article>
+    </div>
+    <div className="example-calculation"><strong>Ví dụ:</strong> 2 xe × 500.000 + 30 km × 15.000 + 120 phút × 3.000 = <b>1.810.000 VNĐ</b>. Phục vụ 8 điểm thì bình quân <b>226.250 VNĐ/điểm</b>.</div>
+
+    <h3>2. Thời gian tại từng điểm</h3>
+    <div className="formula-grid">
+      <article className="formula-card"><strong>Đến điểm</strong><code>arrival = departure trước + travelTime</code><p>TDVRPTW chọn travelTime theo khung giao thông tại lúc xe rời điểm trước.</p></article>
+      <article className="formula-card"><strong>Bắt đầu phục vụ</strong><code>serviceStart = max(arrival, readyTime)</code><p>Nếu xe đến sớm, xe phải chờ đến lúc khách mở time window.</p></article>
+      <article className="formula-card"><strong>Chờ và rời điểm</strong><code>waiting = serviceStart − arrival<br />departure = serviceStart + serviceTime</code><p>Vi phạm time window khi serviceStart lớn hơn dueTime.</p></article>
+    </div>
+
+    <h3>3. Tải trọng, objective và validation</h3>
+    <div className="table-scroll meaning-table"><table><thead><tr><th>Thông số</th><th>Cách tính / ý nghĩa</th></tr></thead><tbody>
+      <tr><td>Tải đầu tuyến</td><td>Tổng demand của các đơn trên tuyến; sau mỗi khách: loadAfter = loadBefore − demand.</td></tr>
+      <tr><td>Capacity valid</td><td>Không xe nào vượt capacityWeight/capacityVolume và tải không âm.</td></tr>
+      <tr><td>Coverage valid</td><td>Mỗi đơn phải được phục vụ đúng một lần, không thiếu và không trùng.</td></tr>
+      <tr><td>Time window valid</td><td>Mọi điểm bắt đầu phục vụ không muộn hơn dueTime và xe về trong thời gian cho phép.</td></tr>
+      <tr><td>Structure valid</td><td>Tuyến bắt đầu/kết thúc đúng kho, stop và cung đường liên tục.</td></tr>
+      <tr><td>Objective tối ưu</td><td><code>vehicleUsed × 100.000 + totalDistance</code>. Đây là điểm tối ưu để ưu tiên ít xe rồi mới giảm km, không phải tiền VNĐ.</td></tr>
+      <tr><td>Execution time / Iteration</td><td>Thời gian CPU và số vòng tìm kiếm; dùng để đánh giá tốc độ và quá trình hội tụ thuật toán.</td></tr>
+    </tbody></table></div>
+  </div>;
+}
+
 function App() {
   const [experiments, setExperiments] = useState([]);
   const [datasets, setDatasets] = useState([]);
@@ -89,6 +135,13 @@ function App() {
 
   const selected = detail?.experiment;
   const routes = detail?.routes || [];
+  const countedCustomerStops = routes.reduce((sum, route) => sum + customerStops(route), 0);
+  const servedPointCount = Number(selected?.SERVED_CUSTOMER_COUNT) > 0
+    ? Number(selected.SERVED_CUSTOMER_COUNT)
+    : countedCustomerStops;
+  const averageCostPerPoint = Number(selected?.COST_PER_CUSTOMER) > 0
+    ? Number(selected.COST_PER_CUSTOMER)
+    : costPerPoint(selected?.TOTAL_COST, servedPointCount);
   const selectedAlgorithm = algorithms.find(item => item.code === runConfig.algorithmCode);
 
   const notify = useCallback((message, type = 'success') => {
@@ -190,6 +243,17 @@ function App() {
     catch (error) { notify(error.message, 'error'); }
   };
 
+  const comparisonCostPerPoint = row => {
+    if (Number(row.COST_PER_CUSTOMER) > 0) return Number(row.COST_PER_CUSTOMER);
+    const datasetCustomerCount = Number(row.DATASET_CUSTOMER_COUNT)
+      || Number(datasets.find(item => item.DATASET_CODE === row.DATASET_CODE)?.CUSTOMER_COUNT)
+      || 0;
+    const servedCount = Number(row.SERVED_CUSTOMER_COUNT) > 0
+      ? Number(row.SERVED_CUSTOMER_COUNT)
+      : Math.max(0, datasetCustomerCount - (Number(row.UNSERVED_ORDER_COUNT) || 0));
+    return costPerPoint(row.TOTAL_COST, servedCount);
+  };
+
   const validations = useMemo(() => detail?.validation ? [
     ['Bao phủ đơn hàng', detail.validation.COVERAGE_VALID],
     ['Tải trọng', detail.validation.CAPACITY_VALID],
@@ -225,8 +289,8 @@ function App() {
         <div className="route-summary">
           <div className="section-heading"><span><Truck size={16} /> Tuyến xe ({routes.length})</span></div>
           {routes.map((route, index) => <div key={route.ROUTE_ID} className="route-list-item" style={{ borderLeftColor: ROUTE_COLORS[index % ROUTE_COLORS.length] }}>
-            <strong>{route.VEHICLE_CODE}</strong><span>{Math.max(0, (route.stops?.length || 2) - 2)} khách</span>
-            <small>{Number(route.TOTAL_LOAD).toFixed(1)}/{Number(route.CAPACITY_WEIGHT).toFixed(1)} kg · {Number(route.TOTAL_DISTANCE).toFixed(2)} km</small>
+            <strong>{route.VEHICLE_CODE}</strong><span>{customerStops(route)} khách</span>
+            <small>{Number(route.TOTAL_LOAD).toFixed(1)}/{Number(route.CAPACITY_WEIGHT).toFixed(1)} kg · {Number(route.TOTAL_DISTANCE).toFixed(2)} km · {formatCost(route.TOTAL_COST)} · {formatCost(route.COST_PER_CUSTOMER ?? costPerPoint(route.TOTAL_COST, customerStops(route)))}/điểm</small>
           </div>)}
         </div>
       </aside>
@@ -237,18 +301,22 @@ function App() {
         <div className="metrics-container">
           <MetricCard icon={<Route />} title="Tổng quãng đường" value={Number(selected?.TOTAL_DISTANCE || 0).toFixed(2)} suffix="km" />
           <MetricCard icon={<Truck />} title="Số xe sử dụng" value={selected?.VEHICLE_USED || 0} suffix="xe" tone="purple" />
+          <MetricCard icon={<DollarSign />} title="Tổng chi phí" value={formatCost(selected?.TOTAL_COST)} tone="purple" />
+          <MetricCard icon={<Calculator />} title="Chi phí/điểm" value={formatCost(averageCostPerPoint)} tone="purple" />
           <MetricCard icon={<Clock3 />} title="Di chuyển / Chờ" value={`${formatClock(selected?.TOTAL_TRAVEL_TIME)} / ${formatClock(selected?.TOTAL_WAITING_TIME)}`} tone="green" />
           <MetricCard icon={selected?.IS_FEASIBLE ? <CheckCircle2 /> : <XCircle />} title="Validation" value={selected?.IS_FEASIBLE ? 'KHẢ THI' : 'VI PHẠM'} tone={selected?.IS_FEASIBLE ? 'green' : 'red'} />
         </div>
         <div className="tabs">
-          {[['map', Map, 'Bản đồ'], ['routes', ListChecks, 'Lịch trình'], ['convergence', BarChart3, 'Hội tụ'], ['validation', CheckCircle2, 'Kiểm định']].map(([key, Icon, label]) => <button key={key} className={tab === key ? 'active' : ''} onClick={() => setTab(key)}><Icon size={16} /> {label}</button>)}
+          {[['map', Map, 'Bản đồ'], ['routes', ListChecks, 'Lịch trình'], ['convergence', BarChart3, 'Hội tụ'], ['validation', CheckCircle2, 'Kiểm định'], ['formulas', Calculator, 'Cách tính']].map(([key, Icon, label]) => <button key={key} className={tab === key ? 'active' : ''} onClick={() => setTab(key)}><Icon size={16} /> {label}</button>)}
         </div>
         <section className="workspace glass-panel">
-          {!detail && <Empty text="Chưa có dữ liệu kết quả để phân tích." />}
+          {!detail && tab !== 'formulas' && <Empty text="Chưa có dữ liệu kết quả để phân tích." />}
+          {tab === 'formulas' && <CalculationGuide />}
           {detail && tab === 'map' && <MapVisualizer depots={detail.depots} customers={detail.customers} routes={routes} />}
           {detail && tab === 'routes' && <div className="route-details">{routes.map((route, routeIndex) => <article key={route.ROUTE_ID} className="route-card">
             <h3 style={{ color: ROUTE_COLORS[routeIndex % ROUTE_COLORS.length] }}>{route.VEHICLE_CODE} <span>{route.VEHICLE_TYPE}</span></h3>
-            <p>{Number(route.TOTAL_DISTANCE).toFixed(2)} km · tải {Number(route.TOTAL_LOAD).toFixed(1)} kg · {formatClock(route.START_TIME)}–{formatClock(route.END_TIME)}</p>
+            <p>{Number(route.TOTAL_DISTANCE).toFixed(2)} km · tải {Number(route.TOTAL_LOAD).toFixed(1)} kg · {formatClock(route.START_TIME)}–{formatClock(route.END_TIME)} · chi phí {formatCost(route.TOTAL_COST)}</p>
+            <div className="cost-breakdown"><span>Cố định: <strong>{formatCost(route.FIXED_COST)}</strong></span><span>Quãng đường: <strong>{formatCost(route.DISTANCE_COST)}</strong></span><span>Thời gian: <strong>{formatCost(route.TIME_COST)}</strong></span><span>Tổng: <strong>{formatCost(route.TOTAL_COST)}</strong></span><span>Số điểm: <strong>{customerStops(route)}</strong></span><span>Bình quân/điểm: <strong>{formatCost(route.COST_PER_CUSTOMER ?? costPerPoint(route.TOTAL_COST, customerStops(route)))}</strong></span></div>
             <div className="table-scroll"><table><thead><tr><th>#</th><th>Điểm</th><th>Loại</th><th>Đến</th><th>Bắt đầu</th><th>Rời</th><th>Chờ</th><th>Tải sau</th><th>Vi phạm</th></tr></thead>
               <tbody>{route.stops?.map(stop => <tr key={`${route.ROUTE_ID}-${stop.SEQUENCE_NO}`}><td>{stop.SEQUENCE_NO}</td><td>{stop.CODE}</td><td>{stop.STOP_TYPE}</td><td>{formatClock(stop.ARRIVAL_TIME)}</td><td>{formatClock(stop.SERVICE_START_TIME)}</td><td>{formatClock(stop.DEPARTURE_TIME)}</td><td>{stop.WAITING_TIME}s</td><td>{Number(stop.LOAD_AFTER_WEIGHT).toFixed(1)}</td><td>{Number(stop.CAPACITY_VIOLATION) + Number(stop.TIME_WINDOW_VIOLATION) > 0 ? 'Có' : 'Không'}</td></tr>)}</tbody>
             </table></div>
@@ -256,7 +324,7 @@ function App() {
           {detail && tab === 'convergence' && <ConvergenceChart iterations={detail.iterations} />}
           {detail && tab === 'validation' && <div><div className="validation-grid">{validations.map(([label, valid]) => <div key={label} className={`validation-item ${valid ? 'ok' : 'bad'}`}>{valid ? <CheckCircle2 /> : <XCircle />}<span>{label}</span><strong>{valid ? 'Đạt' : 'Không đạt'}</strong></div>)}</div>
             <h3 className="subheading">Tham số thực thi</h3><div className="parameter-list">{Object.entries(detail.parameters || {}).map(([key, value]) => <span key={key}><strong>{key}</strong>: {value}</span>)}</div>
-            <div className="kpi-strip"><span>Objective: <strong>{Number(selected.OBJECTIVE_VALUE).toFixed(3)}</strong></span><span>CPU: <strong>{selected.EXECUTION_TIME_MS} ms</strong></span><span>Vòng tìm thấy: <strong>{selected.ITERATION_FOUND ?? '-'}</strong></span><span>Đơn chưa phục vụ: <strong>{selected.UNSERVED_ORDER_COUNT}</strong></span></div>
+            <div className="kpi-strip"><span>Chi phí cố định: <strong>{formatCost(selected.FIXED_COST)}</strong></span><span>Chi phí quãng đường: <strong>{formatCost(selected.DISTANCE_COST)}</strong></span><span>Chi phí thời gian: <strong>{formatCost(selected.TIME_COST)}</strong></span><span>Tổng chi phí: <strong>{formatCost(selected.TOTAL_COST)}</strong></span><span>Điểm đã phục vụ: <strong>{servedPointCount}</strong></span><span>Chi phí/điểm: <strong>{formatCost(averageCostPerPoint)}</strong></span><span>Objective tối ưu: <strong>{Number(selected.OBJECTIVE_VALUE).toFixed(3)}</strong></span><span>CPU: <strong>{selected.EXECUTION_TIME_MS} ms</strong></span><span>Vòng tìm thấy: <strong>{selected.ITERATION_FOUND ?? '-'}</strong></span><span>Đơn chưa phục vụ: <strong>{selected.UNSERVED_ORDER_COUNT}</strong></span></div>
           </div>}
         </section>
       </main>
@@ -276,6 +344,8 @@ function App() {
         <form onSubmit={createDataset}><ModalError text={modalError} /><div className="form-row"><Field label="Loại bài toán"><select value={datasetForm.datasetType} onChange={event => setDatasetForm({ ...datasetForm, datasetType: event.target.value })}><option>CVRP</option><option>VRPTW</option><option>TDVRPTW</option></select></Field><Field label="Khu vực"><select value={datasetForm.preset} onChange={event => setDatasetForm({ ...datasetForm, preset: event.target.value })}>{Object.entries(CITY_PRESETS).map(([key, city]) => <option value={key} key={key}>{city.name}</option>)}</select></Field></div>
           <Field label="Tên dataset"><input value={datasetForm.name} placeholder="Tự sinh nếu để trống" onChange={event => setDatasetForm({ ...datasetForm, name: event.target.value })} /></Field>
           <div className="form-row">{[['customerCount', 'Số khách', 1], ['vehicleCount', 'Số xe', 1], ['vehicleCapacity', 'Tải xe (kg)', 0.01], ['radiusKm', 'Bán kính (km)', 0.1], ['minDemand', 'Demand nhỏ nhất', 0.01], ['maxDemand', 'Demand lớn nhất', 0.01]].map(([key, label, step]) => <Field key={key} label={label}><input type="number" min="1" step={step} value={datasetForm[key]} onChange={event => setDatasetForm({ ...datasetForm, [key]: Number(event.target.value) })} /></Field>)}</div>
+          <h4 className="subheading">Cấu hình chi phí mỗi xe (VNĐ)</h4>
+          <div className="form-row">{[['vehicleFixedCost', 'Chi phí cố định/xe (VNĐ)', 1000], ['costPerKm', 'Chi phí mỗi km (VNĐ)', 1000], ['costPerMinute', 'Chi phí mỗi phút hoạt động (VNĐ)', 100]].map(([key, label, step]) => <Field key={key} label={label}><input type="number" min="0" step={step} value={datasetForm[key]} onChange={event => setDatasetForm({ ...datasetForm, [key]: Number(event.target.value) })} /></Field>)}</div>
           <div className="info-box">Ước tính nhu cầu: <strong>{Math.round(datasetForm.customerCount * (datasetForm.minDemand + datasetForm.maxDemand) / 2)} kg</strong> · sức chở: <strong>{datasetForm.vehicleCount * datasetForm.vehicleCapacity} kg</strong>{datasetForm.datasetType === 'TDVRPTW' && ' · tự sinh 5 khung giao thông cho mỗi cung.'}</div>
           <ModalActions busy={busy} onCancel={() => setShowCreate(false)} submit="Tạo dataset" />
         </form>
@@ -283,7 +353,7 @@ function App() {
 
       {showDatasets && <Modal title="Quản lý dataset" icon={<Database />} onClose={() => setShowDatasets(false)} wide><div className="table-scroll"><table><thead><tr><th>Mã</th><th>Tên</th><th>Loại</th><th>Khách</th><th>Xe</th><th>Traffic</th><th></th></tr></thead><tbody>{datasets.map(ds => <tr key={ds.DATASET_ID}><td>{ds.DATASET_CODE}</td><td>{ds.DATASET_NAME}</td><td><span className="pill">{ds.DATASET_TYPE}</span></td><td>{ds.CUSTOMER_COUNT}</td><td>{ds.VEHICLE_COUNT}</td><td>{ds.TIME_DEPENDENT ? 'Có' : 'Không'}</td><td><button className="icon-btn danger" onClick={() => deleteDataset(ds.DATASET_ID)}><Trash2 /></button></td></tr>)}</tbody></table></div></Modal>}
 
-      {compareData && <Modal title="So sánh experiment" icon={<BarChart3 />} onClose={() => setCompareData(null)} wide><div className="table-scroll"><table><thead><tr><th>Experiment</th><th>Thuật toán</th><th>Dataset</th><th>Xe</th><th>Distance</th><th>Travel</th><th>Waiting</th><th>CPU</th><th>Valid</th></tr></thead><tbody>{compareData.map(row => <tr key={row.EXPERIMENT_ID}><td>{row.EXPERIMENT_CODE}</td><td>{row.ALGORITHM_CODE}</td><td>{row.DATASET_CODE}</td><td>{row.VEHICLE_USED}</td><td>{Number(row.TOTAL_DISTANCE).toFixed(3)}</td><td>{formatClock(row.TOTAL_TRAVEL_TIME)}</td><td>{formatClock(row.TOTAL_WAITING_TIME)}</td><td>{row.EXECUTION_TIME_MS} ms</td><td>{row.IS_FEASIBLE ? 'Đạt' : 'Lỗi'}</td></tr>)}</tbody></table></div></Modal>}
+      {compareData && <Modal title="So sánh experiment" icon={<BarChart3 />} onClose={() => setCompareData(null)} wide><div className="table-scroll"><table><thead><tr><th>Experiment</th><th>Thuật toán</th><th>Dataset</th><th>Xe</th><th>Distance</th><th>Chi phí</th><th>CP/điểm</th><th>Travel</th><th>Waiting</th><th>CPU</th><th>Valid</th></tr></thead><tbody>{compareData.map(row => <tr key={row.EXPERIMENT_ID}><td>{row.EXPERIMENT_CODE}</td><td>{row.ALGORITHM_CODE}</td><td>{row.DATASET_CODE}</td><td>{row.VEHICLE_USED}</td><td>{Number(row.TOTAL_DISTANCE).toFixed(3)}</td><td>{formatCost(row.TOTAL_COST)}</td><td>{formatCost(comparisonCostPerPoint(row))}</td><td>{formatClock(row.TOTAL_TRAVEL_TIME)}</td><td>{formatClock(row.TOTAL_WAITING_TIME)}</td><td>{row.EXECUTION_TIME_MS} ms</td><td>{row.IS_FEASIBLE ? 'Đạt' : 'Lỗi'}</td></tr>)}</tbody></table></div></Modal>}
     </div>
   );
 }

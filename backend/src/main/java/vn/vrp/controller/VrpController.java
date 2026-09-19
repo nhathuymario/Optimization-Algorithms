@@ -47,10 +47,29 @@ public class VrpController {
         String sql = """
                 SELECT e.experiment_id, e.experiment_code, e.start_time, e.end_time,
                        e.status, e.random_seed, d.dataset_code,
+                       d.customer_count AS dataset_customer_count,
                        a.algorithm_code, a.algorithm_name,
                        r.total_distance, r.total_travel_time,
                        r.total_waiting_time, r.vehicle_used,
-                       r.objective_value, r.execution_time_ms, r.is_feasible
+                       r.objective_value, r.execution_time_ms, r.is_feasible,
+                       r.unserved_order_count,
+                       COALESCE((
+                           SELECT SUM(
+                               v.fixed_cost
+                               + rr.total_distance * v.cost_per_km
+                               + (rr.total_travel_time + rr.total_waiting_time
+                                  + rr.total_service_time) / 60.0 * v.cost_per_minute)
+                           FROM route_result rr
+                           JOIN vehicle v ON v.vehicle_id = rr.vehicle_id
+                           WHERE rr.result_id = r.result_id
+                       ), 0) AS total_cost,
+                       COALESCE((
+                           SELECT COUNT(*)
+                           FROM route_result rr
+                           JOIN route_stop_result rs ON rs.route_id = rr.route_id
+                           WHERE rr.result_id = r.result_id
+                             AND rs.stop_type = 'CUSTOMER'
+                       ), 0) AS served_customer_count
                 FROM experiment e
                 JOIN dataset d ON d.dataset_id = e.dataset_id
                 JOIN algorithm a ON a.algorithm_id = e.algorithm_id
@@ -82,10 +101,29 @@ public class VrpController {
         String sql = """
                 SELECT e.experiment_id, e.experiment_code, e.start_time, e.end_time,
                        e.status, e.random_seed, d.dataset_code,
+                       d.customer_count AS dataset_customer_count,
                        a.algorithm_code, a.algorithm_name,
                        r.total_distance, r.total_travel_time,
                        r.total_waiting_time, r.vehicle_used,
-                       r.objective_value, r.execution_time_ms, r.is_feasible
+                       r.objective_value, r.execution_time_ms, r.is_feasible,
+                       r.unserved_order_count,
+                       COALESCE((
+                           SELECT SUM(
+                               v.fixed_cost
+                               + rr.total_distance * v.cost_per_km
+                               + (rr.total_travel_time + rr.total_waiting_time
+                                  + rr.total_service_time) / 60.0 * v.cost_per_minute)
+                           FROM route_result rr
+                           JOIN vehicle v ON v.vehicle_id = rr.vehicle_id
+                           WHERE rr.result_id = r.result_id
+                       ), 0) AS total_cost,
+                       COALESCE((
+                           SELECT COUNT(*)
+                           FROM route_result rr
+                           JOIN route_stop_result rs ON rs.route_id = rr.route_id
+                           WHERE rr.result_id = r.result_id
+                             AND rs.stop_type = 'CUSTOMER'
+                       ), 0) AS served_customer_count
                 FROM experiment e
                 JOIN dataset d ON d.dataset_id = e.dataset_id
                 JOIN algorithm a ON a.algorithm_id = e.algorithm_id
@@ -121,7 +159,9 @@ public class VrpController {
             }
             response.put("depots", loadDepots(connection, ids.datasetId()));
             response.put("customers", loadCustomers(connection, ids.datasetId()));
-            response.put("routes", loadRoutes(connection, ids.resultId()));
+            List<Map<String, Object>> routes = loadRoutes(connection, ids.resultId());
+            response.put("routes", routes);
+            addCostSummary(response, routes);
             response.put("parameters", loadParameters(connection, id));
             response.put("iterations", loadIterations(connection, id));
             response.put("validation", loadValidation(connection, ids.resultId()));
@@ -341,7 +381,8 @@ public class VrpController {
             throws Exception {
         String sql = """
                 SELECT r.*, v.vehicle_code, v.vehicle_type,
-                       v.capacity_weight, v.capacity_volume
+                       v.capacity_weight, v.capacity_volume,
+                       v.fixed_cost, v.cost_per_km, v.cost_per_minute
                 FROM route_result r
                 JOIN vehicle v ON v.vehicle_id = r.vehicle_id
                 WHERE r.result_id = ?
@@ -367,10 +408,33 @@ public class VrpController {
                     route.put("TOTAL_TRAVEL_TIME", result.getInt("total_travel_time"));
                     route.put("TOTAL_WAITING_TIME", result.getInt("total_waiting_time"));
                     route.put("TOTAL_SERVICE_TIME", result.getInt("total_service_time"));
+                    double fixedCost = result.getDouble("fixed_cost");
+                    double distanceCost = result.getDouble("total_distance")
+                            * result.getDouble("cost_per_km");
+                    double timeCost = (result.getInt("total_travel_time")
+                            + result.getInt("total_waiting_time")
+                            + result.getInt("total_service_time"))
+                            / 60.0 * result.getDouble("cost_per_minute");
+                    route.put("FIXED_COST_RATE", fixedCost);
+                    route.put("COST_PER_KM", result.getDouble("cost_per_km"));
+                    route.put("COST_PER_MINUTE", result.getDouble("cost_per_minute"));
+                    route.put("FIXED_COST", roundCost(fixedCost));
+                    route.put("DISTANCE_COST", roundCost(distanceCost));
+                    route.put("TIME_COST", roundCost(timeCost));
+                    double totalCost = fixedCost + distanceCost + timeCost;
+                    route.put("TOTAL_COST", roundCost(totalCost));
                     route.put("START_TIME", result.getInt("start_time"));
                     route.put("END_TIME", result.getInt("end_time"));
                     route.put("IS_FEASIBLE", result.getBoolean("is_feasible") ? 1 : 0);
-                    route.put("stops", loadStops(connection, routeId));
+                    List<Map<String, Object>> stops = loadStops(connection, routeId);
+                    long customerStopCount = stops.stream()
+                            .filter(stop -> "CUSTOMER".equals(stop.get("STOP_TYPE")))
+                            .count();
+                    route.put("CUSTOMER_STOP_COUNT", customerStopCount);
+                    route.put("COST_PER_CUSTOMER", customerStopCount == 0
+                            ? 0
+                            : roundCost(totalCost / customerStopCount));
+                    route.put("stops", stops);
                     routes.add(route);
                 }
             }
@@ -528,11 +592,62 @@ public class VrpController {
         map.put("TOTAL_WAITING_TIME", result.getObject("total_waiting_time"));
         map.put("VEHICLE_USED", result.getObject("vehicle_used"));
         map.put("OBJECTIVE_VALUE", result.getObject("objective_value"));
+        Object totalCostValue = result.getObject("total_cost");
+        long servedCustomerCount = result.getLong("served_customer_count");
+        map.put("TOTAL_COST", totalCostValue);
+        map.put("DATASET_CUSTOMER_COUNT", result.getInt("dataset_customer_count"));
+        map.put("UNSERVED_ORDER_COUNT", result.getObject("unserved_order_count"));
+        map.put("SERVED_CUSTOMER_COUNT", servedCustomerCount);
+        map.put("COST_PER_CUSTOMER", servedCustomerCount == 0
+                ? 0
+                : roundCost(number(totalCostValue) / servedCustomerCount));
         map.put("EXECUTION_TIME_MS", result.getObject("execution_time_ms"));
         map.put("IS_FEASIBLE", result.getObject("is_feasible") == null
                 ? null
                 : result.getBoolean("is_feasible") ? 1 : 0);
         return map;
+    }
+
+    /** Tổng hợp chi phí từ các route để cả dữ liệu cũ cũng hiển thị được mà không cần migration. */
+    @SuppressWarnings("unchecked")
+    private void addCostSummary(
+            Map<String, Object> response,
+            List<Map<String, Object>> routes) {
+        double fixedCost = routes.stream()
+                .mapToDouble(route -> number(route.get("FIXED_COST")))
+                .sum();
+        double distanceCost = routes.stream()
+                .mapToDouble(route -> number(route.get("DISTANCE_COST")))
+                .sum();
+        double timeCost = routes.stream()
+                .mapToDouble(route -> number(route.get("TIME_COST")))
+                .sum();
+        long servedCustomerCount = routes.stream()
+                .mapToLong(route -> ((Number) route.getOrDefault(
+                        "CUSTOMER_STOP_COUNT",
+                        0)).longValue())
+                .sum();
+        double totalCost = fixedCost + distanceCost + timeCost;
+        Object value = response.get("experiment");
+        if (value instanceof Map<?, ?> rawExperiment) {
+            Map<String, Object> experiment = (Map<String, Object>) rawExperiment;
+            experiment.put("FIXED_COST", roundCost(fixedCost));
+            experiment.put("DISTANCE_COST", roundCost(distanceCost));
+            experiment.put("TIME_COST", roundCost(timeCost));
+            experiment.put("TOTAL_COST", roundCost(totalCost));
+            experiment.put("SERVED_CUSTOMER_COUNT", servedCustomerCount);
+            experiment.put("COST_PER_CUSTOMER", servedCustomerCount == 0
+                    ? 0
+                    : roundCost(totalCost / servedCustomerCount));
+        }
+    }
+
+    private double number(Object value) {
+        return value instanceof Number number ? number.doubleValue() : 0;
+    }
+
+    private double roundCost(double value) {
+        return Math.round(value * 1_000_000d) / 1_000_000d;
     }
 
     private ProblemInstance withCapacity(ProblemInstance problem, double capacity) {

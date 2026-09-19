@@ -73,6 +73,18 @@ class AlgorithmSolversTest {
         assertTrue(validation.errors().stream().anyMatch(error -> error.contains("Tổng khoảng cách")));
     }
 
+    @Test
+    void solutionCalculatesFixedDistanceAndTimeCost() {
+        ProblemInstance problem = fixture();
+        Solution solution = new AlgorithmRegistry()
+                .require("BASELINE_SEQUENTIAL_INSERTION")
+                .solve(problem, new SolverOptions(1, 1, 0, Map.of()))
+                .solution();
+        // Fixture: fixed_cost=100, cost_per_km=1 và cost_per_minute=0.
+        double expected = solution.routes().size() * 100 + solution.totalDistance();
+        assertEquals(expected, solution.totalCost(), 1e-9);
+    }
+
     private ProblemInstance fixture() {
         Depot depot = new Depot(1, 1, "D0", 28_800, 43_200);
         List<Customer> customers = List.of(

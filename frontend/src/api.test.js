@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildRunPayload, defaultParameters, formatClock } from './api.js';
+import {
+  buildRunPayload, costPerPoint, defaultParameters, formatClock, formatCost,
+} from './api.js';
 import { createMapProjection } from './mapProjection.js';
 
 test('buildRunPayload chuẩn hóa kiểu dữ liệu gửi tới API', () => {
@@ -18,6 +20,16 @@ test('buildRunPayload chuẩn hóa kiểu dữ liệu gửi tới API', () => {
 test('formatClock hiển thị giây theo HH:mm:ss', () => {
   assert.equal(formatClock(3661), '01:01:01');
   assert.equal(formatClock(null), '00:00:00');
+});
+
+test('formatCost hiển thị chi phí theo định dạng VNĐ', () => {
+  assert.equal(formatCost(231_256), '231.256 VNĐ');
+  assert.equal(formatCost(null), '0 VNĐ');
+});
+
+test('costPerPoint tính bình quân trên số điểm khách đã phục vụ', () => {
+  assert.equal(costPerPoint(1_810_000, 8), 226_250);
+  assert.equal(costPerPoint(1_000_000, 0), 0);
 });
 
 test('defaultParameters lấy cấu hình mặc định từ metadata', () => {

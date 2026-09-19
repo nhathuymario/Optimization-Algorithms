@@ -187,6 +187,9 @@ public class DatasetController {
                 result.put("customerCount", request.customerCount());
                 result.put("vehicleCount", request.vehicleCount());
                 result.put("vehicleCapacity", request.vehicleCapacity());
+                result.put("vehicleFixedCost", request.vehicleFixedCost());
+                result.put("costPerKm", request.costPerKm());
+                result.put("costPerMinute", request.costPerMinute());
                 return ResponseEntity.ok(result);
             } catch (Exception exception) {
                 connection.rollback();
@@ -402,7 +405,7 @@ public class DatasetController {
                     start_depot_id, end_depot_id,
                     available_from, available_to,
                     fixed_cost, cost_per_km, cost_per_minute, is_active)
-                VALUES (?, ?, 'STANDARD', ?, 0, ?, ?, 28800, 64800, 100, 1, 0, 1)
+                VALUES (?, ?, 'STANDARD', ?, 0, ?, ?, 28800, 64800, ?, ?, ?, 1)
                 """;
         try (var statement = connection.prepareStatement(sql)) {
             for (int index = 1; index <= request.vehicleCount(); index++) {
@@ -411,6 +414,9 @@ public class DatasetController {
                 statement.setDouble(3, request.vehicleCapacity());
                 statement.setLong(4, depotId);
                 statement.setLong(5, depotId);
+                statement.setDouble(6, request.vehicleFixedCost());
+                statement.setDouble(7, request.costPerKm());
+                statement.setDouble(8, request.costPerMinute());
                 statement.addBatch();
             }
             statement.executeBatch();
@@ -562,6 +568,9 @@ public class DatasetController {
             int customerCount,
             int vehicleCount,
             double vehicleCapacity,
+            double vehicleFixedCost,
+            double costPerKm,
+            double costPerMinute,
             double minDemand,
             double maxDemand,
             double centerLat,
@@ -580,6 +589,9 @@ public class DatasetController {
                 int customers = integer(payload, "customerCount", 8);
                 int vehicles = integer(payload, "vehicleCount", 2);
                 double capacity = decimal(payload, "vehicleCapacity", 40);
+                double fixedCost = decimal(payload, "vehicleFixedCost", 500_000);
+                double costPerKm = decimal(payload, "costPerKm", 15_000);
+                double costPerMinute = decimal(payload, "costPerMinute", 3_000);
                 double minDemand = decimal(payload, "minDemand", 5);
                 double maxDemand = decimal(payload, "maxDemand", 15);
                 double centerLat = decimal(payload, "centerLat", 10.7769);
@@ -594,12 +606,13 @@ public class DatasetController {
                 if (customers <= 0 || customers > 500
                         || vehicles <= 0 || vehicles > 100
                         || capacity <= 0
+                        || fixedCost < 0 || costPerKm < 0 || costPerMinute < 0
                         || minDemand <= 0 || maxDemand < minDemand
                         || radius <= 0 || radius > 500
                         || centerLat < -90 || centerLat > 90
                         || centerLng < -180 || centerLng > 180) {
                     throw new IllegalArgumentException(
-                            "Kiểm tra số khách/xe, capacity, demand, radius và tọa độ");
+                            "Kiểm tra số khách/xe, capacity, chi phí, demand, radius và tọa độ");
                 }
                 return new GeneratorRequest(
                         name,
@@ -607,6 +620,9 @@ public class DatasetController {
                         customers,
                         vehicles,
                         capacity,
+                        fixedCost,
+                        costPerKm,
+                        costPerMinute,
                         minDemand,
                         maxDemand,
                         centerLat,
