@@ -14,4 +14,9 @@ public record ProblemInstance(long datasetId, String code, String type, Depot de
         if (arc == null) throw new IllegalStateException("Thiếu cạnh khoảng cách " + from + " -> " + to);
         return arc;
     }
+
+    /** Lấy thời gian di chuyển có xét traffic profile tại thời điểm xuất phát. */
+    public int travelTime(long from, long to, int departureTime) {
+        return arc(from, to).travelTimeAt(departureTime);
+    }
 }

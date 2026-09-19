@@ -1,34 +1,95 @@
 package vn.vrp.algorithm.greedy;
-import vn.vrp.model.*; import java.util.*;
-public final class GreedyCvrpSolver {
-    private static final double EPS=1e-9;
-    public Solution solve(ProblemInstance instance) {
-        long started=System.nanoTime(); Set<Customer> remaining=new LinkedHashSet<>(instance.customers()); List<Route> routes=new ArrayList<>();
-        for(Vehicle vehicle:instance.vehicles()) {
-            if(remaining.isEmpty())break; List<Customer> selected=new ArrayList<>(); double weight=0,volume=0; long current=instance.depot().locationId();
-            while(true){ final long from=current; final double usedW=weight,usedV=volume;
-                Customer next=remaining.stream().filter(x->usedW+x.demandWeight()<=vehicle.capacityWeight()+EPS)
-                    .filter(x->vehicle.capacityVolume()<=EPS || usedV+x.demandVolume()<=vehicle.capacityVolume()+EPS)
-                    .min(Comparator.comparingDouble((Customer x)->instance.arc(from,x.locationId()).distance()).thenComparingLong(Customer::orderId)).orElse(null);
-                if(next==null)break; selected.add(next);remaining.remove(next);weight+=next.demandWeight();volume+=next.demandVolume();current=next.locationId();
-            }
-            if(!selected.isEmpty())routes.add(buildRoute(instance,vehicle,selected));
-        }
-        if(!remaining.isEmpty())throw new IllegalStateException("Không đủ xe/tải trọng để phục vụ "+remaining.size()+" đơn hàng");
-        double distance=routes.stream().mapToDouble(Route::totalDistance).sum(); int travel=routes.stream().mapToInt(Route::totalTravelTime).sum();
-        int waiting=routes.stream().mapToInt(Route::totalWaitingTime).sum(), service=routes.stream().mapToInt(Route::totalServiceTime).sum();
-        double cost=routes.stream().mapToDouble(r->r.vehicle().fixedCost()+r.totalDistance()*r.vehicle().costPerKm()+(r.totalTravelTime()+r.totalWaitingTime()+r.totalServiceTime())/60.0*r.vehicle().costPerMinute()).sum();
-        return new Solution(routes,distance,travel,waiting,service,cost,(System.nanoTime()-started)/1_000_000,routes.stream().allMatch(Route::feasible));
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
+import vn.vrp.algorithm.SolutionSupport;
+import vn.vrp.algorithm.SolverOptions;
+import vn.vrp.algorithm.SolverRun;
+import vn.vrp.algorithm.VrpSolver;
+import vn.vrp.model.Customer;
+import vn.vrp.model.ProblemInstance;
+import vn.vrp.model.Solution;
+import vn.vrp.model.Vehicle;
+
+/**
+ * Baseline nearest-neighbor có kiểm tra capacity, vehicle type và time window.
+ * Thuật toán nhanh, xác định và phù hợp để tạo nghiệm đầu cho metaheuristic.
+ */
+public final class GreedyCvrpSolver implements VrpSolver {
+    public static final String CODE = "BASELINE_SEQUENTIAL_INSERTION";
+
+    @Override
+    public String code() {
+        return CODE;
     }
-    private Route buildRoute(ProblemInstance p,Vehicle v,List<Customer> customers){
-        List<RouteStop> stops=new ArrayList<>(); int time=Math.max(p.depot().openTime(),v.availableFrom()),start=time,travel=0,waiting=0,service=0; double distance=0,loadW=customers.stream().mapToDouble(Customer::demandWeight).sum(),loadV=customers.stream().mapToDouble(Customer::demandVolume).sum(),remainingW=loadW,remainingV=loadV; long at=p.depot().locationId(); boolean feasible=loadW<=v.capacityWeight()+EPS&&(v.capacityVolume()<=EPS||loadV<=v.capacityVolume()+EPS);
-        stops.add(new RouteStop(RouteStop.Type.DEPOT_START,at,null,time,time,time,0,0,0,0,0,remainingW,0,remainingV,0,0,0,0));
-        for(Customer x:customers){TravelArc arc=p.arc(at,x.locationId());int arrival=time+arc.travelTime(),begin=Math.max(arrival,x.readyTime()),wait=begin-arrival,depart=begin+x.serviceTime(),tw=Math.max(0,begin-x.dueTime());
-            stops.add(new RouteStop(RouteStop.Type.CUSTOMER,x.locationId(),x.orderId(),arrival,begin,depart,wait,x.serviceTime(),x.demandWeight(),x.demandVolume(),remainingW,remainingW-x.demandWeight(),remainingV,remainingV-x.demandVolume(),arc.distance(),arc.travelTime(),0,tw));
-            distance+=arc.distance();travel+=arc.travelTime();waiting+=wait;service+=x.serviceTime();time=depart;at=x.locationId();remainingW-=x.demandWeight();remainingV-=x.demandVolume();feasible&=tw==0;
+
+    /** API tương thích với test/code cũ. */
+    public Solution solve(ProblemInstance instance) {
+        return solve(instance, new SolverOptions(0, 1, 0, null)).solution();
+    }
+
+    @Override
+    public SolverRun solve(ProblemInstance instance, SolverOptions options) {
+        long started = System.nanoTime();
+        Set<Customer> remaining = new LinkedHashSet<>(instance.customers());
+        List<List<Customer>> assignments = SolutionSupport.emptyAssignments(instance);
+
+        for (int vehicleIndex = 0; vehicleIndex < instance.vehicles().size(); vehicleIndex++) {
+            Vehicle vehicle = instance.vehicles().get(vehicleIndex);
+            List<Customer> selected = assignments.get(vehicleIndex);
+            long currentLocation = instance.depot().locationId();
+
+            while (!remaining.isEmpty()) {
+                final long from = currentLocation;
+                Customer next = remaining.stream()
+                        .filter(customer -> SolutionSupport.canAppend(
+                                instance,
+                                vehicle,
+                                selected,
+                                customer))
+                        .min(Comparator
+                                .comparingDouble((Customer customer) ->
+                                        instance.arc(from, customer.locationId()).distance())
+                                // Due time là tiêu chí phụ khi hai điểm cách đều nhau.
+                                .thenComparingInt(Customer::dueTime)
+                                .thenComparing(Comparator.comparingInt(Customer::priority).reversed())
+                                .thenComparingLong(Customer::orderId))
+                        .orElse(null);
+
+                if (next == null) {
+                    break;
+                }
+                selected.add(next);
+                remaining.remove(next);
+                currentLocation = next.locationId();
+            }
+
+            if (remaining.isEmpty()) {
+                break;
+            }
         }
-        TravelArc back=p.arc(at,p.depot().locationId());int end=time+back.travelTime();distance+=back.distance();travel+=back.travelTime();feasible&=end<=Math.min(p.depot().closeTime(),v.availableTo());
-        stops.add(new RouteStop(RouteStop.Type.DEPOT_END,p.depot().locationId(),null,end,end,end,0,0,0,0,remainingW,0,remainingV,0,back.distance(),back.travelTime(),0,Math.max(0,end-p.depot().closeTime())));
-        return new Route(v,customers,stops,distance,travel,waiting,service,loadW,loadV,start,end,feasible);
+
+        if (!remaining.isEmpty()) {
+            List<Long> unserved = remaining.stream().map(Customer::orderId).toList();
+            throw new IllegalStateException(
+                    "Không tìm được route khả thi cho " + remaining.size()
+                            + " đơn hàng: " + unserved);
+        }
+
+        Solution solution = SolutionSupport.buildSolution(instance, assignments, started);
+        return SolverRun.singleStep(solution);
+    }
+
+    /**
+     * Tạo một permutation khả thi theo baseline; được GA/ACO dùng làm chromosome mồi.
+     */
+    public List<Customer> seedPermutation(ProblemInstance instance) {
+        Solution solution = solve(instance);
+        List<Customer> permutation = new ArrayList<>();
+        solution.routes().forEach(route -> permutation.addAll(route.customers()));
+        return permutation;
     }
 }

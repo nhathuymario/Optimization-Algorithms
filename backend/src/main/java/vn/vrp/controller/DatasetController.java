@@ -1,291 +1,641 @@
 package vn.vrp.controller;
 
-import org.springframework.web.bind.annotation.*;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Random;
+import java.util.Set;
 import org.springframework.http.ResponseEntity;
-import java.util.*;
-import java.sql.*;
+import org.springframework.web.bind.annotation.CrossOrigin;
+import org.springframework.web.bind.annotation.DeleteMapping;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestMethod;
+import org.springframework.web.bind.annotation.RestController;
 import vn.vrp.db.DatabaseConfig;
 
+/** API quản trị và sinh dataset CVRP/VRPTW/TDVRPTW. */
 @RestController
 @RequestMapping("/api/datasets")
-@CrossOrigin(origins = "*", methods = {RequestMethod.GET, RequestMethod.POST, RequestMethod.PUT, RequestMethod.DELETE, RequestMethod.OPTIONS})
+@CrossOrigin(origins = "*", methods = {
+        RequestMethod.GET,
+        RequestMethod.POST,
+        RequestMethod.DELETE,
+        RequestMethod.OPTIONS
+})
 public class DatasetController {
 
     @GetMapping
     public ResponseEntity<List<Map<String, Object>>> getAllDatasets() {
-        List<Map<String, Object>> list = new ArrayList<>();
-        String sql = "SELECT DATASET_ID, DATASET_CODE, DATASET_NAME, DATASET_TYPE, CUSTOMER_COUNT, VEHICLE_COUNT, CREATED_AT " +
-                     "FROM DATASET ORDER BY DATASET_ID DESC";
-
-        try (Connection conn = DatabaseConfig.from(DatabaseConfig.loadProperties()).connect();
-             PreparedStatement stmt = conn.prepareStatement(sql);
-             ResultSet rs = stmt.executeQuery()) {
-
-            while (rs.next()) {
-                Map<String, Object> item = new HashMap<>();
-                item.put("DATASET_ID", rs.getLong("DATASET_ID"));
-                item.put("DATASET_CODE", rs.getString("DATASET_CODE"));
-                item.put("DATASET_NAME", rs.getString("DATASET_NAME"));
-                item.put("DATASET_TYPE", rs.getString("DATASET_TYPE"));
-                item.put("CUSTOMER_COUNT", rs.getInt("CUSTOMER_COUNT"));
-                item.put("VEHICLE_COUNT", rs.getInt("VEHICLE_COUNT"));
-                item.put("CREATED_AT", rs.getString("CREATED_AT"));
-                list.add(item);
+        String sql = """
+                SELECT dataset_id, dataset_code, dataset_name, dataset_type,
+                       customer_count, vehicle_count, depot_count,
+                       distance_type, time_dependent, created_at
+                FROM dataset
+                ORDER BY dataset_id DESC
+                """;
+        List<Map<String, Object>> datasets = new ArrayList<>();
+        try (Connection connection = connect();
+                var statement = connection.prepareStatement(sql);
+                var result = statement.executeQuery()) {
+            while (result.next()) {
+                Map<String, Object> item = new LinkedHashMap<>();
+                item.put("DATASET_ID", result.getLong("dataset_id"));
+                item.put("DATASET_CODE", result.getString("dataset_code"));
+                item.put("DATASET_NAME", result.getString("dataset_name"));
+                item.put("DATASET_TYPE", result.getString("dataset_type"));
+                item.put("CUSTOMER_COUNT", result.getInt("customer_count"));
+                item.put("VEHICLE_COUNT", result.getInt("vehicle_count"));
+                item.put("DEPOT_COUNT", result.getInt("depot_count"));
+                item.put("DISTANCE_TYPE", result.getString("distance_type"));
+                item.put("TIME_DEPENDENT", result.getBoolean("time_dependent") ? 1 : 0);
+                item.put("CREATED_AT", result.getString("created_at"));
+                datasets.add(item);
             }
-        } catch (Exception e) {
-            e.printStackTrace();
+            return ResponseEntity.ok(datasets);
+        } catch (Exception exception) {
+            exception.printStackTrace();
             return ResponseEntity.internalServerError().build();
         }
-        return ResponseEntity.ok(list);
     }
 
-    @PostMapping("/generate")
-    public ResponseEntity<Map<String, Object>> generateDataset(@RequestBody Map<String, Object> payload) {
-        String name = payload.getOrDefault("name", "").toString();
-        int customerCount = payload.containsKey("customerCount") ? Integer.parseInt(payload.get("customerCount").toString()) : 8;
-        int vehicleCount = payload.containsKey("vehicleCount") ? Integer.parseInt(payload.get("vehicleCount").toString()) : 2;
-        double vehicleCapacity = payload.containsKey("vehicleCapacity") ? Double.parseDouble(payload.get("vehicleCapacity").toString()) : 40.0;
-        double minDemand = payload.containsKey("minDemand") ? Double.parseDouble(payload.get("minDemand").toString()) : 5.0;
-        double maxDemand = payload.containsKey("maxDemand") ? Double.parseDouble(payload.get("maxDemand").toString()) : 15.0;
-        double centerLat = payload.containsKey("centerLat") ? Double.parseDouble(payload.get("centerLat").toString()) : 10.7769; // Default: TP.HCM
-        double centerLng = payload.containsKey("centerLng") ? Double.parseDouble(payload.get("centerLng").toString()) : 106.7009;
-        double radiusKm = payload.containsKey("radiusKm") ? Double.parseDouble(payload.get("radiusKm").toString()) : 6.0;
-        long seed = payload.containsKey("seed") ? Long.parseLong(payload.get("seed").toString()) : System.currentTimeMillis();
-
-        if (customerCount <= 0 || vehicleCount <= 0 || vehicleCapacity <= 0) {
-            return ResponseEntity.badRequest().body(Map.of("error", "Tham số không hợp lệ: số khách, số xe và tải trọng phải > 0"));
-        }
-
-        Random rand = new Random(seed);
-        String code = "DS_" + System.currentTimeMillis();
-        if (name == null || name.isBlank()) {
-            name = "Dataset " + customerCount + " điểm (" + vehicleCount + " xe)";
-        }
-
-        try (Connection conn = DatabaseConfig.from(DatabaseConfig.loadProperties()).connect()) {
-            conn.setAutoCommit(false);
-            try {
-                // 1. Insert DATASET
-                long datasetId;
-                String dsSql = "INSERT INTO dataset (dataset_code, dataset_name, dataset_type, source_type, " +
-                               "customer_count, vehicle_count, depot_count, distance_type, time_dependent, " +
-                               "version_no, generator_version, random_seed, checksum, description, created_at) " +
-                               "VALUES (?, ?, 'CVRP', 'SYNTHETIC', ?, ?, 1, 'HAVERSINE', 0, '1.0', 'generator-v1', ?, ?, ?, NOW())";
-                try (PreparedStatement ps = conn.prepareStatement(dsSql, Statement.RETURN_GENERATED_KEYS)) {
-                    ps.setString(1, code);
-                    ps.setString(2, name);
-                    ps.setInt(3, customerCount);
-                    ps.setInt(4, vehicleCount);
-                    ps.setLong(5, seed);
-                    ps.setString(6, "CHECKSUM_" + seed);
-                    ps.setString(7, "Sinh tự động từ Web UI: " + customerCount + " khách, " + vehicleCount + " xe, capacity=" + vehicleCapacity);
-                    ps.executeUpdate();
-                    ResultSet keys = ps.getGeneratedKeys();
-                    if (!keys.next()) throw new SQLException("Không lấy được generated ID cho dataset");
-                    datasetId = keys.getLong(1);
-                }
-
-                // 2. Insert Depot Location
-                long depotLocationId;
-                String locSql = "INSERT INTO location (dataset_id, location_code, location_name, location_type, latitude, longitude, x_coordinate, y_coordinate, created_at) " +
-                                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())";
-                try (PreparedStatement ps = conn.prepareStatement(locSql, Statement.RETURN_GENERATED_KEYS)) {
-                    ps.setLong(1, datasetId);
-                    ps.setString(2, "D0");
-                    ps.setString(3, "Kho Trung Tâm (" + name + ")");
-                    ps.setString(4, "DEPOT");
-                    ps.setDouble(5, centerLat);
-                    ps.setDouble(6, centerLng);
-                    ps.setDouble(7, 0.0);
-                    ps.setDouble(8, 0.0);
-                    ps.executeUpdate();
-                    ResultSet keys = ps.getGeneratedKeys();
-                    if (!keys.next()) throw new SQLException("Không lấy được generated ID cho depot location");
-                    depotLocationId = keys.getLong(1);
-                }
-
-                // 3. Insert DEPOT
-                long depotId;
-                String depotSql = "INSERT INTO depot (dataset_id, location_id, depot_code, depot_name, open_time, close_time, is_active) " +
-                                  "VALUES (?, ?, 'D0', 'Kho Trung Tâm', 28800, 64800, 1)";
-                try (PreparedStatement ps = conn.prepareStatement(depotSql, Statement.RETURN_GENERATED_KEYS)) {
-                    ps.setLong(1, datasetId);
-                    ps.setLong(2, depotLocationId);
-                    ps.executeUpdate();
-                    ResultSet keys = ps.getGeneratedKeys();
-                    if (!keys.next()) throw new SQLException("Không lấy được generated ID cho depot");
-                    depotId = keys.getLong(1);
-                }
-
-                // 4. Insert Customers & Locations & Delivery Orders
-                List<LocationPoint> allPoints = new ArrayList<>();
-                allPoints.add(new LocationPoint(depotLocationId, "D0", centerLat, centerLng));
-
-                for (int i = 1; i <= customerCount; i++) {
-                    double angle = rand.nextDouble() * 2 * Math.PI;
-                    double r = radiusKm * Math.sqrt(rand.nextDouble()); // uniform disk
-                    double dLat = (r * Math.cos(angle)) / 111.0;
-                    double dLng = (r * Math.sin(angle)) / (111.0 * Math.cos(Math.toRadians(centerLat)));
-                    double cLat = centerLat + dLat;
-                    double cLng = centerLng + dLng;
-
-                    long custLocId;
-                    try (PreparedStatement ps = conn.prepareStatement(locSql, Statement.RETURN_GENERATED_KEYS)) {
-                        ps.setLong(1, datasetId);
-                        ps.setString(2, "C" + i);
-                        ps.setString(3, "Khách hàng #" + i);
-                        ps.setString(4, "CUSTOMER");
-                        ps.setDouble(5, cLat);
-                        ps.setDouble(6, cLng);
-                        ps.setDouble(7, r * Math.cos(angle));
-                        ps.setDouble(8, r * Math.sin(angle));
-                        ps.executeUpdate();
-                        ResultSet keys = ps.getGeneratedKeys();
-                        if (!keys.next()) throw new SQLException("Không lấy được generated ID cho customer location");
-                        custLocId = keys.getLong(1);
+    /** Trả order và vehicle để FE kiểm tra dataset trước khi chạy. */
+    @GetMapping("/{id}")
+    public ResponseEntity<Map<String, Object>> getDatasetDetail(@PathVariable("id") long id) {
+        Map<String, Object> response = new LinkedHashMap<>();
+        try (Connection connection = connect()) {
+            try (var statement = connection.prepareStatement(
+                    "SELECT * FROM dataset WHERE dataset_id = ?")) {
+                statement.setLong(1, id);
+                try (var result = statement.executeQuery()) {
+                    if (!result.next()) {
+                        return ResponseEntity.notFound().build();
                     }
-
-                    allPoints.add(new LocationPoint(custLocId, "C" + i, cLat, cLng));
-
-                    long customerId;
-                    String custSql = "INSERT INTO customer (dataset_id, location_id, customer_code, customer_name, service_time, time_window_start, time_window_end, priority, is_active) " +
-                                     "VALUES (?, ?, ?, ?, 600, 28800, 64800, 1, 1)";
-                    try (PreparedStatement ps = conn.prepareStatement(custSql, Statement.RETURN_GENERATED_KEYS)) {
-                        ps.setLong(1, datasetId);
-                        ps.setLong(2, custLocId);
-                        ps.setString(3, "C" + i);
-                        ps.setString(4, "Khách hàng " + i);
-                        ps.executeUpdate();
-                        ResultSet keys = ps.getGeneratedKeys();
-                        if (!keys.next()) throw new SQLException("Không lấy được customerId");
-                        customerId = keys.getLong(1);
-                    }
-
-                    double demand = Math.round((minDemand + rand.nextDouble() * (maxDemand - minDemand)) * 10.0) / 10.0;
-                    if (demand < 1.0) demand = 1.0;
-
-                    String orderSql = "INSERT INTO delivery_order (dataset_id, customer_id, order_code, demand_weight, demand_volume, ready_time, due_time, service_time, status, priority, created_at) " +
-                                      "VALUES (?, ?, ?, ?, 0.0, 28800, 64800, 600, 'PENDING', 1, NOW())";
-                    try (PreparedStatement ps = conn.prepareStatement(orderSql)) {
-                        ps.setLong(1, datasetId);
-                        ps.setLong(2, customerId);
-                        ps.setString(3, "O" + i);
-                        ps.setDouble(4, demand);
-                        ps.executeUpdate();
-                    }
+                    Map<String, Object> dataset = new LinkedHashMap<>();
+                    dataset.put("DATASET_ID", result.getLong("dataset_id"));
+                    dataset.put("DATASET_CODE", result.getString("dataset_code"));
+                    dataset.put("DATASET_NAME", result.getString("dataset_name"));
+                    dataset.put("DATASET_TYPE", result.getString("dataset_type"));
+                    dataset.put("SOURCE_TYPE", result.getString("source_type"));
+                    dataset.put("CUSTOMER_COUNT", result.getInt("customer_count"));
+                    dataset.put("VEHICLE_COUNT", result.getInt("vehicle_count"));
+                    dataset.put("DEPOT_COUNT", result.getInt("depot_count"));
+                    dataset.put("DISTANCE_TYPE", result.getString("distance_type"));
+                    dataset.put("TIME_DEPENDENT", result.getBoolean("time_dependent") ? 1 : 0);
+                    dataset.put("RANDOM_SEED", result.getObject("random_seed"));
+                    dataset.put("DESCRIPTION", result.getString("description"));
+                    response.put("dataset", dataset);
                 }
-
-                // 5. Insert Vehicles
-                String vehSql = "INSERT INTO vehicle (dataset_id, vehicle_code, vehicle_type, capacity_weight, capacity_volume, start_depot_id, end_depot_id, available_from, available_to, fixed_cost, cost_per_km, cost_per_minute, is_active) " +
-                                "VALUES (?, ?, 'STANDARD', ?, 0.0, ?, ?, 28800, 64800, 100.0, 1.0, 0.0, 1)";
-                for (int v = 1; v <= vehicleCount; v++) {
-                    try (PreparedStatement ps = conn.prepareStatement(vehSql)) {
-                        ps.setLong(1, datasetId);
-                        ps.setString(2, "V" + v);
-                        ps.setDouble(3, vehicleCapacity);
-                        ps.setLong(4, depotId);
-                        ps.setLong(5, depotId);
-                        ps.executeUpdate();
-                    }
-                }
-
-                // 6. Insert Location Distance Matrix
-                String distSql = "INSERT INTO location_distance (dataset_id, from_location_id, to_location_id, distance, base_travel_time) " +
-                                 "VALUES (?, ?, ?, ?, ?)";
-                try (PreparedStatement ps = conn.prepareStatement(distSql)) {
-                    for (LocationPoint p1 : allPoints) {
-                        for (LocationPoint p2 : allPoints) {
-                            if (p1.id == p2.id) continue; // Database requires from_location_id != to_location_id
-
-                            double distKm = calcHaversine(p1.lat, p1.lng, p2.lat, p2.lng);
-                            if (distKm < 0.05) distKm = 0.05;
-                            int travelSec = (int) Math.round((distKm / 30.0) * 3600.0); // 30 km/h average city speed
-
-                            ps.setLong(1, datasetId);
-                            ps.setLong(2, p1.id);
-                            ps.setLong(3, p2.id);
-                            ps.setDouble(4, Math.round(distKm * 100.0) / 100.0);
-                            ps.setInt(5, travelSec);
-                            ps.addBatch();
-                        }
-                    }
-                    ps.executeBatch();
-                }
-
-                conn.commit();
-
-                Map<String, Object> resp = new HashMap<>();
-                resp.put("success", true);
-                resp.put("datasetId", datasetId);
-                resp.put("code", code);
-                resp.put("name", name);
-                resp.put("customerCount", customerCount);
-                resp.put("vehicleCount", vehicleCount);
-                resp.put("vehicleCapacity", vehicleCapacity);
-                return ResponseEntity.ok(resp);
-
-            } catch (Exception ex) {
-                conn.rollback();
-                ex.printStackTrace();
-                return ResponseEntity.internalServerError().body(Map.of("error", "Lỗi tạo dataset: " + ex.getMessage()));
             }
-        } catch (Exception e) {
-            e.printStackTrace();
-            return ResponseEntity.internalServerError().body(Map.of("error", e.getMessage()));
+
+            response.put("orders", queryRows(connection, """
+                    SELECT order_id, order_code, customer_code, customer_name,
+                           demand_weight, demand_volume, ready_time, due_time,
+                           service_time, required_vehicle_type, priority, status
+                    FROM v_order_problem_input
+                    WHERE dataset_id = ?
+                    ORDER BY order_id
+                    """, id));
+            response.put("vehicles", queryRows(connection, """
+                    SELECT vehicle_id, vehicle_code, vehicle_type,
+                           capacity_weight, capacity_volume,
+                           available_from, available_to,
+                           fixed_cost, cost_per_km, cost_per_minute, is_active
+                    FROM vehicle
+                    WHERE dataset_id = ?
+                    ORDER BY vehicle_id
+                    """, id));
+            response.put("trafficProfileCount", scalarCount(
+                    connection,
+                    "SELECT COUNT(*) FROM travel_time_profile WHERE dataset_id = ?",
+                    id));
+            return ResponseEntity.ok(response);
+        } catch (Exception exception) {
+            exception.printStackTrace();
+            return ResponseEntity.internalServerError()
+                    .body(Map.of("error", "Lỗi đọc dataset: " + exception.getMessage()));
+        }
+    }
+
+    /**
+     * Sinh dataset quanh tọa độ trung tâm. TDVRPTW được tạo thêm traffic profile
+     * cho từng cung; VRPTW/TDVRPTW có cửa sổ thời gian hẹp hơn CVRP.
+     */
+    @PostMapping("/generate")
+    public ResponseEntity<Map<String, Object>> generateDataset(
+            @RequestBody Map<String, Object> payload) {
+        final GeneratorRequest request;
+        try {
+            request = GeneratorRequest.from(payload);
+        } catch (IllegalArgumentException exception) {
+            return ResponseEntity.badRequest().body(Map.of("error", exception.getMessage()));
+        }
+
+        Random random = new Random(request.seed());
+        String code = "DS_" + System.currentTimeMillis();
+        String name = request.name().isBlank()
+                ? "Dataset " + request.datasetType() + " " + request.customerCount() + " điểm"
+                : request.name();
+
+        try (Connection connection = connect()) {
+            connection.setAutoCommit(false);
+            try {
+                long datasetId = insertDataset(connection, code, name, request);
+                long depotLocationId = insertLocation(
+                        connection,
+                        datasetId,
+                        "D0",
+                        "Kho trung tâm (" + name + ')',
+                        "DEPOT",
+                        request.centerLat(),
+                        request.centerLng(),
+                        0,
+                        0);
+                long depotId = insertDepot(connection, datasetId, depotLocationId);
+
+                List<LocationPoint> points = new ArrayList<>();
+                points.add(new LocationPoint(
+                        depotLocationId,
+                        request.centerLat(),
+                        request.centerLng()));
+                insertCustomersAndOrders(connection, datasetId, request, random, points);
+                insertVehicles(connection, datasetId, depotId, request);
+                insertDistanceMatrix(connection, datasetId, points);
+                if (request.timeDependent()) {
+                    insertTrafficProfiles(connection, datasetId);
+                }
+
+                connection.commit();
+                Map<String, Object> result = new LinkedHashMap<>();
+                result.put("success", true);
+                result.put("datasetId", datasetId);
+                result.put("code", code);
+                result.put("name", name);
+                result.put("datasetType", request.datasetType());
+                result.put("timeDependent", request.timeDependent());
+                result.put("customerCount", request.customerCount());
+                result.put("vehicleCount", request.vehicleCount());
+                result.put("vehicleCapacity", request.vehicleCapacity());
+                return ResponseEntity.ok(result);
+            } catch (Exception exception) {
+                connection.rollback();
+                exception.printStackTrace();
+                return ResponseEntity.internalServerError()
+                        .body(Map.of("error", "Lỗi tạo dataset: " + exception.getMessage()));
+            }
+        } catch (Exception exception) {
+            exception.printStackTrace();
+            return ResponseEntity.internalServerError()
+                    .body(Map.of("error", "Lỗi kết nối database: " + exception.getMessage()));
         }
     }
 
     @DeleteMapping("/{id}")
     public ResponseEntity<Map<String, Object>> deleteDataset(@PathVariable("id") long id) {
-        try (Connection conn = DatabaseConfig.from(DatabaseConfig.loadProperties()).connect()) {
-            conn.setAutoCommit(false);
+        try (Connection connection = connect()) {
+            connection.setAutoCommit(false);
             try {
-                // Delete experiments associated with this dataset
-                execute(conn, "DELETE FROM experiment_parameter_value WHERE experiment_id IN (SELECT experiment_id FROM experiment WHERE dataset_id = ?)", id);
-                execute(conn, "DELETE FROM route_stop_result WHERE route_id IN (SELECT route_id FROM route_result WHERE result_id IN (SELECT result_id FROM experiment_result WHERE experiment_id IN (SELECT experiment_id FROM experiment WHERE dataset_id = ?)))", id);
-                execute(conn, "DELETE FROM route_result WHERE result_id IN (SELECT result_id FROM experiment_result WHERE experiment_id IN (SELECT experiment_id FROM experiment WHERE dataset_id = ?))", id);
-                execute(conn, "DELETE FROM experiment_result WHERE experiment_id IN (SELECT experiment_id FROM experiment WHERE dataset_id = ?)", id);
-                execute(conn, "DELETE FROM experiment WHERE dataset_id = ?", id);
-
-                // Delete dataset items
-                execute(conn, "DELETE FROM location_distance WHERE dataset_id = ?", id);
-                execute(conn, "DELETE FROM delivery_order WHERE dataset_id = ?", id);
-                execute(conn, "DELETE FROM customer WHERE dataset_id = ?", id);
-                execute(conn, "DELETE FROM vehicle WHERE dataset_id = ?", id);
-                execute(conn, "DELETE FROM depot WHERE dataset_id = ?", id);
-                execute(conn, "DELETE FROM location WHERE dataset_id = ?", id);
-                execute(conn, "DELETE FROM dataset WHERE dataset_id = ?", id);
-
-                conn.commit();
+                // experiment -> result -> route -> stop và parameter/log đã ON DELETE CASCADE.
+                execute(connection, "DELETE FROM experiment WHERE dataset_id = ?", id);
+                execute(connection, "DELETE FROM travel_time_profile WHERE dataset_id = ?", id);
+                execute(connection, "DELETE FROM location_distance WHERE dataset_id = ?", id);
+                execute(connection, "DELETE FROM delivery_order WHERE dataset_id = ?", id);
+                execute(connection, "DELETE FROM customer WHERE dataset_id = ?", id);
+                execute(connection, "DELETE FROM driver WHERE dataset_id = ?", id);
+                execute(connection, "DELETE FROM vehicle WHERE dataset_id = ?", id);
+                execute(connection, "DELETE FROM depot WHERE dataset_id = ?", id);
+                execute(connection, "DELETE FROM location WHERE dataset_id = ?", id);
+                int affected = execute(connection, "DELETE FROM dataset WHERE dataset_id = ?", id);
+                if (affected == 0) {
+                    connection.rollback();
+                    return ResponseEntity.notFound().build();
+                }
+                connection.commit();
                 return ResponseEntity.ok(Map.of("success", true, "datasetId", id));
-            } catch (Exception e) {
-                conn.rollback();
-                e.printStackTrace();
-                return ResponseEntity.status(500).body(Map.of("success", false, "error", e.getMessage()));
+            } catch (Exception exception) {
+                connection.rollback();
+                exception.printStackTrace();
+                return ResponseEntity.internalServerError()
+                        .body(Map.of("success", false, "error", exception.getMessage()));
             }
-        } catch (Exception e) {
-            e.printStackTrace();
-            return ResponseEntity.status(500).body(Map.of("success", false, "error", e.getMessage()));
+        } catch (Exception exception) {
+            exception.printStackTrace();
+            return ResponseEntity.internalServerError()
+                    .body(Map.of("success", false, "error", exception.getMessage()));
         }
     }
 
-    private void execute(Connection conn, String sql, long id) throws SQLException {
-        try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setLong(1, id);
-            ps.executeUpdate();
+    private long insertDataset(
+            Connection connection,
+            String code,
+            String name,
+            GeneratorRequest request) throws SQLException {
+        String sql = """
+                INSERT INTO dataset(
+                    dataset_code, dataset_name, dataset_type, source_type,
+                    customer_count, vehicle_count, depot_count, distance_type,
+                    time_dependent, version_no, generator_version,
+                    random_seed, checksum, description, created_at)
+                VALUES (?, ?, ?, 'SYNTHETIC', ?, ?, 1, 'HAVERSINE', ?,
+                        '2.0', 'generator-v2', ?, ?, ?, NOW())
+                """;
+        try (var statement = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
+            statement.setString(1, code);
+            statement.setString(2, name);
+            statement.setString(3, request.datasetType());
+            statement.setInt(4, request.customerCount());
+            statement.setInt(5, request.vehicleCount());
+            statement.setBoolean(6, request.timeDependent());
+            statement.setLong(7, request.seed());
+            statement.setString(8, "GEN-" + request.seed());
+            statement.setString(9, "Sinh tự động " + request.datasetType()
+                    + ": " + request.customerCount() + " khách, "
+                    + request.vehicleCount() + " xe");
+            statement.executeUpdate();
+            return generatedKey(statement);
         }
     }
 
-    private double calcHaversine(double lat1, double lon1, double lat2, double lon2) {
-        double R = 6371.0; // km
-        double dLat = Math.toRadians(lat2 - lat1);
-        double dLon = Math.toRadians(lon2 - lon1);
-        double a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-                   Math.cos(Math.toRadians(lat1)) * Math.cos(Math.toRadians(lat2)) *
-                   Math.sin(dLon / 2) * Math.sin(dLon / 2);
-        double c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-        return R * c;
+    private long insertLocation(
+            Connection connection,
+            long datasetId,
+            String code,
+            String name,
+            String type,
+            double latitude,
+            double longitude,
+            double x,
+            double y) throws SQLException {
+        String sql = """
+                INSERT INTO location(
+                    dataset_id, location_code, location_name, location_type,
+                    latitude, longitude, x_coordinate, y_coordinate, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())
+                """;
+        try (var statement = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
+            statement.setLong(1, datasetId);
+            statement.setString(2, code);
+            statement.setString(3, name);
+            statement.setString(4, type);
+            statement.setDouble(5, latitude);
+            statement.setDouble(6, longitude);
+            statement.setDouble(7, x);
+            statement.setDouble(8, y);
+            statement.executeUpdate();
+            return generatedKey(statement);
+        }
     }
 
-    private record LocationPoint(long id, String code, double lat, double lng) {}
+    private long insertDepot(Connection connection, long datasetId, long locationId)
+            throws SQLException {
+        String sql = """
+                INSERT INTO depot(
+                    dataset_id, location_id, depot_code, depot_name,
+                    open_time, close_time, is_active)
+                VALUES (?, ?, 'D0', 'Kho trung tâm', 28800, 64800, 1)
+                """;
+        try (var statement = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
+            statement.setLong(1, datasetId);
+            statement.setLong(2, locationId);
+            statement.executeUpdate();
+            return generatedKey(statement);
+        }
+    }
+
+    private void insertCustomersAndOrders(
+            Connection connection,
+            long datasetId,
+            GeneratorRequest request,
+            Random random,
+            List<LocationPoint> points) throws SQLException {
+        String customerSql = """
+                INSERT INTO customer(
+                    dataset_id, location_id, customer_code, customer_name,
+                    service_time, time_window_start, time_window_end,
+                    priority, is_active)
+                VALUES (?, ?, ?, ?, 600, ?, ?, 1, 1)
+                """;
+        String orderSql = """
+                INSERT INTO delivery_order(
+                    dataset_id, customer_id, order_code,
+                    demand_weight, demand_volume,
+                    ready_time, due_time, service_time,
+                    status, priority, created_at)
+                VALUES (?, ?, ?, ?, 0, ?, ?, 600, 'PENDING', 1, NOW())
+                """;
+
+        for (int index = 1; index <= request.customerCount(); index++) {
+            double angle = random.nextDouble() * 2 * Math.PI;
+            double radius = request.radiusKm() * Math.sqrt(random.nextDouble());
+            double x = radius * Math.cos(angle);
+            double y = radius * Math.sin(angle);
+            double latitude = request.centerLat() + y / 111.0;
+            double longitude = request.centerLng()
+                    + x / (111.0 * Math.cos(Math.toRadians(request.centerLat())));
+            long locationId = insertLocation(
+                    connection,
+                    datasetId,
+                    "C" + index,
+                    "Khách hàng " + index,
+                    "CUSTOMER",
+                    latitude,
+                    longitude,
+                    x,
+                    y);
+            points.add(new LocationPoint(locationId, latitude, longitude));
+
+            int readyTime = 28800;
+            int dueTime = 64800;
+            if (!"CVRP".equals(request.datasetType())) {
+                readyTime = 28800 + random.nextInt(7 * 3600 + 1);
+                dueTime = Math.min(64800, readyTime + (2 + random.nextInt(3)) * 3600);
+            }
+
+            long customerId;
+            try (var statement = connection.prepareStatement(
+                    customerSql,
+                    Statement.RETURN_GENERATED_KEYS)) {
+                statement.setLong(1, datasetId);
+                statement.setLong(2, locationId);
+                statement.setString(3, "C" + index);
+                statement.setString(4, "Khách hàng " + index);
+                statement.setInt(5, readyTime);
+                statement.setInt(6, dueTime);
+                statement.executeUpdate();
+                customerId = generatedKey(statement);
+            }
+
+            double demand = Math.round((request.minDemand()
+                    + random.nextDouble() * (request.maxDemand() - request.minDemand())) * 10) / 10.0;
+            try (var statement = connection.prepareStatement(orderSql)) {
+                statement.setLong(1, datasetId);
+                statement.setLong(2, customerId);
+                statement.setString(3, "O" + index);
+                statement.setDouble(4, demand);
+                statement.setInt(5, readyTime);
+                statement.setInt(6, dueTime);
+                statement.executeUpdate();
+            }
+        }
+    }
+
+    private void insertVehicles(
+            Connection connection,
+            long datasetId,
+            long depotId,
+            GeneratorRequest request) throws SQLException {
+        String sql = """
+                INSERT INTO vehicle(
+                    dataset_id, vehicle_code, vehicle_type,
+                    capacity_weight, capacity_volume,
+                    start_depot_id, end_depot_id,
+                    available_from, available_to,
+                    fixed_cost, cost_per_km, cost_per_minute, is_active)
+                VALUES (?, ?, 'STANDARD', ?, 0, ?, ?, 28800, 64800, 100, 1, 0, 1)
+                """;
+        try (var statement = connection.prepareStatement(sql)) {
+            for (int index = 1; index <= request.vehicleCount(); index++) {
+                statement.setLong(1, datasetId);
+                statement.setString(2, "V" + index);
+                statement.setDouble(3, request.vehicleCapacity());
+                statement.setLong(4, depotId);
+                statement.setLong(5, depotId);
+                statement.addBatch();
+            }
+            statement.executeBatch();
+        }
+    }
+
+    private void insertDistanceMatrix(
+            Connection connection,
+            long datasetId,
+            List<LocationPoint> points) throws SQLException {
+        String sql = """
+                INSERT INTO location_distance(
+                    dataset_id, from_location_id, to_location_id,
+                    distance, base_travel_time)
+                VALUES (?, ?, ?, ?, ?)
+                """;
+        try (var statement = connection.prepareStatement(sql)) {
+            for (LocationPoint from : points) {
+                for (LocationPoint to : points) {
+                    if (from.id() == to.id()) {
+                        continue;
+                    }
+                    double distance = Math.max(
+                            0.05,
+                            haversine(from.latitude(), from.longitude(), to.latitude(), to.longitude()));
+                    int travelTime = Math.max(1, (int) Math.round(distance / 30.0 * 3600));
+                    statement.setLong(1, datasetId);
+                    statement.setLong(2, from.id());
+                    statement.setLong(3, to.id());
+                    statement.setDouble(4, Math.round(distance * 100) / 100.0);
+                    statement.setInt(5, travelTime);
+                    statement.addBatch();
+                }
+            }
+            statement.executeBatch();
+        }
+    }
+
+    /** Tạo profile phủ kín 24 giờ, không chồng lấn. */
+    private void insertTrafficProfiles(Connection connection, long datasetId)
+            throws SQLException {
+        String select = "SELECT distance_id, base_travel_time "
+                + "FROM location_distance WHERE dataset_id = ?";
+        String insert = """
+                INSERT INTO travel_time_profile(
+                    dataset_id, distance_id, start_time, end_time,
+                    travel_time, speed_factor, traffic_level)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """;
+        Object[][] bands = {
+                {0, 25200, 1.00, "FREE"},
+                {25200, 32400, 0.60, "CONGESTED"},
+                {32400, 57600, 0.85, "NORMAL"},
+                {57600, 68400, 0.55, "SEVERE"},
+                {68400, 86400, 0.90, "NORMAL"}
+        };
+        try (var query = connection.prepareStatement(select);
+                var write = connection.prepareStatement(insert)) {
+            query.setLong(1, datasetId);
+            try (var result = query.executeQuery()) {
+                while (result.next()) {
+                    long distanceId = result.getLong("distance_id");
+                    int base = result.getInt("base_travel_time");
+                    for (Object[] band : bands) {
+                        double factor = (double) band[2];
+                        write.setLong(1, datasetId);
+                        write.setLong(2, distanceId);
+                        write.setInt(3, (int) band[0]);
+                        write.setInt(4, (int) band[1]);
+                        write.setInt(5, Math.max(1, (int) Math.round(base / factor)));
+                        write.setDouble(6, factor);
+                        write.setString(7, (String) band[3]);
+                        write.addBatch();
+                    }
+                }
+            }
+            write.executeBatch();
+        }
+    }
+
+    private List<Map<String, Object>> queryRows(
+            Connection connection,
+            String sql,
+            long id) throws SQLException {
+        List<Map<String, Object>> rows = new ArrayList<>();
+        try (var statement = connection.prepareStatement(sql)) {
+            statement.setLong(1, id);
+            try (var result = statement.executeQuery()) {
+                ResultSetMetaData metadata = result.getMetaData();
+                while (result.next()) {
+                    Map<String, Object> row = new LinkedHashMap<>();
+                    for (int column = 1; column <= metadata.getColumnCount(); column++) {
+                        row.put(
+                                metadata.getColumnLabel(column).toUpperCase(Locale.ROOT),
+                                result.getObject(column));
+                    }
+                    rows.add(row);
+                }
+            }
+        }
+        return rows;
+    }
+
+    private long scalarCount(Connection connection, String sql, long id) throws SQLException {
+        try (var statement = connection.prepareStatement(sql)) {
+            statement.setLong(1, id);
+            try (var result = statement.executeQuery()) {
+                result.next();
+                return result.getLong(1);
+            }
+        }
+    }
+
+    private int execute(Connection connection, String sql, long id) throws SQLException {
+        try (var statement = connection.prepareStatement(sql)) {
+            statement.setLong(1, id);
+            return statement.executeUpdate();
+        }
+    }
+
+    private long generatedKey(PreparedStatement statement) throws SQLException {
+        try (var result = statement.getGeneratedKeys()) {
+            if (!result.next()) {
+                throw new SQLException("Không nhận được generated key");
+            }
+            return result.getLong(1);
+        }
+    }
+
+    private double haversine(double lat1, double lon1, double lat2, double lon2) {
+        double earthRadiusKm = 6371.0;
+        double deltaLat = Math.toRadians(lat2 - lat1);
+        double deltaLon = Math.toRadians(lon2 - lon1);
+        double a = Math.sin(deltaLat / 2) * Math.sin(deltaLat / 2)
+                + Math.cos(Math.toRadians(lat1)) * Math.cos(Math.toRadians(lat2))
+                * Math.sin(deltaLon / 2) * Math.sin(deltaLon / 2);
+        return earthRadiusKm * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    }
+
+    private Connection connect() throws Exception {
+        return DatabaseConfig.from(DatabaseConfig.loadProperties()).connect();
+    }
+
+    private record LocationPoint(long id, double latitude, double longitude) {}
+
+    private record GeneratorRequest(
+            String name,
+            String datasetType,
+            int customerCount,
+            int vehicleCount,
+            double vehicleCapacity,
+            double minDemand,
+            double maxDemand,
+            double centerLat,
+            double centerLng,
+            double radiusKm,
+            long seed) {
+
+        private boolean timeDependent() {
+            return "TDVRPTW".equals(datasetType);
+        }
+
+        private static GeneratorRequest from(Map<String, Object> payload) {
+            try {
+                String name = text(payload, "name", "");
+                String type = text(payload, "datasetType", "CVRP").toUpperCase(Locale.ROOT);
+                int customers = integer(payload, "customerCount", 8);
+                int vehicles = integer(payload, "vehicleCount", 2);
+                double capacity = decimal(payload, "vehicleCapacity", 40);
+                double minDemand = decimal(payload, "minDemand", 5);
+                double maxDemand = decimal(payload, "maxDemand", 15);
+                double centerLat = decimal(payload, "centerLat", 10.7769);
+                double centerLng = decimal(payload, "centerLng", 106.7009);
+                double radius = decimal(payload, "radiusKm", 6);
+                long seed = longNumber(payload, "seed", System.currentTimeMillis());
+
+                if (!Set.of("CVRP", "VRPTW", "TDVRPTW").contains(type)) {
+                    throw new IllegalArgumentException(
+                            "datasetType phải là CVRP, VRPTW hoặc TDVRPTW");
+                }
+                if (customers <= 0 || customers > 500
+                        || vehicles <= 0 || vehicles > 100
+                        || capacity <= 0
+                        || minDemand <= 0 || maxDemand < minDemand
+                        || radius <= 0 || radius > 500
+                        || centerLat < -90 || centerLat > 90
+                        || centerLng < -180 || centerLng > 180) {
+                    throw new IllegalArgumentException(
+                            "Kiểm tra số khách/xe, capacity, demand, radius và tọa độ");
+                }
+                return new GeneratorRequest(
+                        name,
+                        type,
+                        customers,
+                        vehicles,
+                        capacity,
+                        minDemand,
+                        maxDemand,
+                        centerLat,
+                        centerLng,
+                        radius,
+                        seed);
+            } catch (NumberFormatException exception) {
+                throw new IllegalArgumentException("Tham số số không đúng định dạng", exception);
+            }
+        }
+
+        private static String text(Map<String, Object> values, String key, String fallback) {
+            Object value = values.get(key);
+            return value == null ? fallback : value.toString();
+        }
+
+        private static int integer(Map<String, Object> values, String key, int fallback) {
+            Object value = values.get(key);
+            return value == null ? fallback : Integer.parseInt(value.toString());
+        }
+
+        private static long longNumber(Map<String, Object> values, String key, long fallback) {
+            Object value = values.get(key);
+            return value == null ? fallback : Long.parseLong(value.toString());
+        }
+
+        private static double decimal(Map<String, Object> values, String key, double fallback) {
+            Object value = values.get(key);
+            return value == null ? fallback : Double.parseDouble(value.toString());
+        }
+    }
 }
